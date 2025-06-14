@@ -1,0 +1,26 @@
+# Environnement virtuel
+venv/
+.env/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Données (locales ou intermédiaires)
+data/raw/
+data/interim/
+data/processed/
+data/model/
+*.parquet
+*.csv
+*.npy
+*.index
+
+# Logs / junk
+*.log
+.DS_Store
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
