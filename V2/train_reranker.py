@@ -1,163 +1,100 @@
 #!/usr/bin/env python3
 """
-train_reranker.py  – v2.3 (robuste LightGBM 4.x)
-================================================
-Reclasse les paires RNA ↔ SIRENE à l’aide d’un **LightGBM Ranker**.
-Optimisé pour gros volumes : échantillonnage PyArrow, float32 compact, logs.
-
-Usage minimal
--------------
-```bash
-python v2/train_reranker.py --sample_rows 5_000_000
-```
-
-Options clés
-------------
---sample_rows N   limite les lignes chargées (RAM)
---gpu             active l’entraînement GPU (si LightGBM GPU dispo)
---num_leaves, --learning_rate, etc. → hyper‑params habituels.
+train_reranker.py – v2.5
+------------------------
+• Early‑stopping LightGBM 4.x (callback)
+• Échantillonnage **stratifié** : on conserve *tous* les positifs, puis on ajoute
+  des négatifs aléatoires jusqu’à `--sample_rows` lignes (ou tout le fichier).
+• Logs clairs sur la répartition pos/neg.
+• Robuste : métriques ignorent les groupes sans positifs ou d’une seule doc.
 """
 from __future__ import annotations
-
-import argparse
-import logging
-import os
+import argparse, logging, os
 from pathlib import Path
 from typing import List
-
-import lightgbm as lgb
-import numpy as np
-import pandas as pd
-import pyarrow.dataset as ds
+import lightgbm as lgb, numpy as np, pandas as pd, pyarrow.dataset as ds
 from sklearn.metrics import average_precision_score, ndcg_score
 from sklearn.model_selection import train_test_split
 
-# ──────────────────────────── Chemins ────────────────────────────
-DATA_PROC = Path("data/processed")
-MODEL_DIR = Path("data/model")
+DATA = Path("data/processed")
+PAIRS_TRAIN, PAIRS_EVAL = DATA/"pairs_train.parquet", DATA/"pairs_eval.parquet"
+RNA_CLEAN, SIRENE_CLEAN = DATA/"rna_clean.parquet", DATA/"sirene_clean.parquet"
+MODEL_PATH = Path("data/model/reranker_lgbm.txt")
 
-PAIRS_TRAIN = DATA_PROC / "pairs_train.parquet"
-PAIRS_EVAL  = DATA_PROC / "pairs_eval.parquet"
-RNA_CLEAN   = DATA_PROC / "rna_clean.parquet"
-SIRENE_CLEAN= DATA_PROC / "sirene_clean.parquet"
-MODEL_PATH  = MODEL_DIR / "reranker_lgbm.txt"
+def _token_len(t: str) -> int: return len(str(t).split())
 
-# ──────────────────────────── Helpers ────────────────────────────
+def _read_sample(path: Path, n: int | None) -> pd.DataFrame:
+    """Lit *path*; garde tous les positifs, complète en négatifs jusqu’à n."""
+    df = ds.dataset(path).to_table().to_pandas() if n else pd.read_parquet(path)
+    if n is None: return df
+    pos = df[df.label == 1]
+    n_pos = len(pos)
+    if n_pos == 0:
+        logging.warning("fichier %s : 0 positif", path.name)
+        return df.sample(n=min(n, len(df)), random_state=42)
+    neg_pool = df[df.label == 0]
+    n_neg = max(min(n - n_pos, len(neg_pool)), 0)
+    neg = neg_pool.sample(n=n_neg, random_state=42)
+    logging.info("   ↪︎ échantillon : %d pos | %d neg", n_pos, n_neg)
+    return pd.concat([pos, neg], ignore_index=True)
 
-def _token_len(txt: str) -> int:  # lightning‑fast token len
-    return len(str(txt).split())
+def _build_feats(p, r, s):
+    r = r.rename(columns={"id":"id_rna","cp":"cp_rna","texte":"txt_rna"})
+    s = s.rename(columns={"cp":"cp_sir","texte":"txt_sir"})
+    d = p.merge(r, on="id_rna").merge(s, on="siret")
+    d["len_rna"] = d["txt_rna"].map(_token_len)
+    d["len_sir"] = d["txt_sir"].map(_token_len)
+    d["len_diff"] = (d["len_rna"]-d["len_sir"]).abs()
+    d["same_cp"] = (d["cp_rna"]==d["cp_sir"]).astype(np.int8)
+    return d
 
-
-def _read_sample(parquet: Path, n_rows: int | None) -> pd.DataFrame:
-    if n_rows is None:
-        return pd.read_parquet(parquet)
-    logging.info(f"◆ lecture échantillon {n_rows:,} → {parquet.name}")
-    dset = ds.dataset(parquet)
-    table = dset.head(n_rows)  # Arrow 11 hot‑path
-    return table.to_pandas()
-
-
-def _build_feats(pairs: pd.DataFrame, rna: pd.DataFrame, sir: pd.DataFrame) -> pd.DataFrame:
-    rna_meta = rna[["id", "cp", "texte"]].rename(columns={"id": "id_rna", "cp": "cp_rna", "texte": "txt_rna"})
-    sir_meta = sir[["siret", "cp", "texte"]].rename(columns={"cp": "cp_sir", "texte": "txt_sir"})
-    df = pairs.merge(rna_meta, on="id_rna").merge(sir_meta, on="siret")
-    df["len_rna"]  = df["txt_rna"].map(_token_len, na_action="ignore")
-    df["len_sir"]  = df["txt_sir"].map(_token_len, na_action="ignore")
-    df["len_diff"] = (df["len_rna"] - df["len_sir"]).abs()
-    df["same_cp"]  = (df["cp_rna"] == df["cp_sir"]).astype(np.int8)
-    return df
-
-
-def _prep_lgbm(df: pd.DataFrame, cols: List[str]):
+def _prep(df, cols):
     X = df[cols].astype(np.float32).values
-    y = df["label"].astype(np.int8).values
-    group = df.groupby("id_rna", sort=False).size().to_numpy(np.int32)
-    return X, y, group
+    y = df.label.astype(np.int8).values
+    g = df.groupby("id_rna", sort=False).size().to_numpy(np.int32)
+    return X, y, g
 
-# ──────────────────────────── Train ────────────────────────────
+def train(params, test_frac, sample, gpu):
+    logging.info("🚀 training")
+    pt = _read_sample(PAIRS_TRAIN, sample)
+    pe = _read_sample(PAIRS_EVAL,  sample//4 if sample else None)
+    r = pd.read_parquet(RNA_CLEAN, columns=["id","cp","texte"])
+    s = pd.read_parquet(SIRENE_CLEAN, columns=["siret","cp","texte"])
 
-def train(params: dict, test_frac: float, sample_rows: int | None, gpu: bool):
-    logging.info("🚀 Launch training")
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    feats=["cos_sim","len_rna","len_sir","len_diff","same_cp"]
+    dt, de = _build_feats(pt,r,s), _build_feats(pe,r,s)
+    q = dt.id_rna.unique(); qt,qv = train_test_split(q,test_size=test_frac,random_state=42)
+    dtr,dval = dt[dt.id_rna.isin(qt)], dt[dt.id_rna.isin(qv)]
+    Xtr,ytr,gtr = _prep(dtr,feats); Xv,yv,gv = _prep(dval,feats)
 
-    # Load data
-    pairs_tr = _read_sample(PAIRS_TRAIN, sample_rows)
-    pairs_ev = _read_sample(PAIRS_EVAL,  sample_rows//4 if sample_rows else None)
-    rna_df   = pd.read_parquet(RNA_CLEAN, columns=["id", "cp", "texte"])
-    sir_df   = pd.read_parquet(SIRENE_CLEAN, columns=["siret", "cp", "texte"])
+    if gpu: params |= {"device_type":"gpu"}
+    bst = lgb.train(params,
+        lgb.Dataset(Xtr,ytr,group=gtr),
+        valid_sets=[lgb.Dataset(Xv,yv,group=gv)],
+        callbacks=[lgb.early_stopping(params["early_stopping_rounds"], verbose=True),
+                   lgb.log_evaluation(50)])
+    bst.save_model(MODEL_PATH)
+    logging.info("💾 saved → %s", MODEL_PATH)
 
-    feats = ["cos_sim", "len_rna", "len_sir", "len_diff", "same_cp"]
+    Xe,ye,ge = _prep(de,feats); yp = bst.predict(Xe, num_iteration=bst.best_iteration)
+    ap = average_precision_score(ye,yp) if ye.sum()>0 else float("nan")
+    splits = np.split(yp,np.cumsum(ge)[:-1]); ysplit = np.split(ye,np.cumsum(ge)[:-1])
+    ndcgs=[ndcg_score([yt],[yp_]) for yt,yp_ in zip(ysplit,splits) if yt.sum()>0 and len(yt)>1]
+    ndcg = float(np.mean(ndcgs)) if ndcgs else float("nan")
+    logging.info("✅ Eval  AP=%.4f | NDCG=%.4f", ap, ndcg)
 
-    logging.info("🔧 feature eng train…")
-    df_tr = _build_feats(pairs_tr, rna_df, sir_df)
-    logging.info("🔧 feature eng eval…")
-    df_ev = _build_feats(pairs_ev, rna_df, sir_df)
-
-    # Split by query id — keeps group structure intact
-    q_ids = df_tr["id_rna"].unique()
-    q_tr, q_val = train_test_split(q_ids, test_size=test_frac, random_state=42)
-    df_train = df_tr[df_tr["id_rna"].isin(q_tr)]
-    df_valid = df_tr[df_tr["id_rna"].isin(q_val)]
-
-    X_tr, y_tr, g_tr = _prep_lgbm(df_train, feats)
-    X_val, y_val, g_val = _prep_lgbm(df_valid, feats)
-
-    if gpu:
-        params |= {"device_type": "gpu", "gpu_platform_id": 0, "gpu_device_id": 0}
-
-    lgb_tr = lgb.Dataset(X_tr, y_tr, group=g_tr, free_raw_data=False)
-    lgb_val= lgb.Dataset(X_val, y_val, group=g_val, reference=lgb_tr, free_raw_data=False)
-
-    booster = lgb.train(
-        params,
-        lgb_tr,
-        valid_sets=[lgb_tr, lgb_val],
-        valid_names=["train", "valid"],
-        num_boost_round=params["num_boost_round"],
-        callbacks=[
-            lgb.early_stopping(params["early_stopping_rounds"], verbose=True),
-            lgb.log_evaluation(period=50),
-        ],
-    )
-
-    booster.save_model(str(MODEL_PATH))
-    logging.info(f"💾 saved → {MODEL_PATH}")
-
-    # Global eval on df_ev
-    X_ev, y_ev, g_ev = _prep_lgbm(df_ev, feats)
-    y_hat = booster.predict(X_ev, num_iteration=booster.best_iteration)
-    ap = average_precision_score(y_ev, y_hat)
-    splits = np.split(y_hat, np.cumsum(g_ev)[:-1])
-    y_true_grp = np.split(y_ev, np.cumsum(g_ev)[:-1])
-    ndcg = np.mean([ndcg_score([yt], [yp]) for yt, yp in zip(y_true_grp, splits)])
-    logging.info(f"✅ Global eval — AP={ap:.4f} | NDCG={ndcg:.4f}")
-
-# ──────────────────────────── CLI ────────────────────────────
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--boosting", default="gbdt", choices=["gbdt", "dart", "goss"])
-    p.add_argument("--num_leaves", type=int, default=63)
     p.add_argument("--learning_rate", type=float, default=0.05)
+    p.add_argument("--num_leaves", type=int, default=63)
     p.add_argument("--num_boost_round", type=int, default=500)
     p.add_argument("--early_stopping_rounds", type=int, default=50)
     p.add_argument("--test_size", type=float, default=0.1)
-    p.add_argument("--sample_rows", type=int, default=None, help="Max lignes pairs_train")
-    p.add_argument("--gpu", action="store_true", help="GPU LightGBM")
-    args = p.parse_args()
+    p.add_argument("--sample_rows", type=int, default=None)
+    p.add_argument("--gpu", action="store_true")
+    a = p.parse_args(); logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-    lgb_params = {
-        "objective": "lambdarank",
-        "metric": "ndcg",
-        "boosting": args.boosting,
-        "learning_rate": args.learning_rate,
-        "num_leaves": args.num_leaves,
-        "verbose": -1,
-        "num_boost_round": args.num_boost_round,
-        "early_stopping_rounds": args.early_stopping_rounds,
-        "seed": 42,
-    }
-
-    train(lgb_params, test_frac=args.test_size,
-          sample_rows=args.sample_rows, gpu=args.gpu)
+    params = {"objective":"lambdarank","metric":"ndcg","boosting":"gbdt","learning_rate":a.learning_rate,
+              "num_leaves":a.num_leaves,"verbose":-1,"num_boost_round":a.num_boost_round,
+              "early_stopping_rounds":a.early_stopping_rounds,"seed":42}
+    train(params,a.test_size,a.sample_rows,a.gpu)
